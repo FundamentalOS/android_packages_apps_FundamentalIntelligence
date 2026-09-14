@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.fundamentalos.intelligence">
+
+    <!-- Permission the weather app guards its IWeatherProvider service with. -->
+    <uses-permission android:name="org.fundamentalos.weather.permission.BIND_WEATHER_PROVIDER" />
+
+    <!-- Package visibility (Android 11+): required so bindService() can resolve
+         the weather app's service by explicit package. -->
+    <queries>
+        <package android:name="org.fundamentalos.weather" />
+    </queries>
+
+    <application
+        android:label="@string/app_name"
+        android:allowBackup="false"
+        android:defaultToDeviceProtectedStorage="true"
+        android:directBootAware="true">
+
+        <service
+            android:name=".smartspace.FundamentalSmartspaceService"
+            android:permission="android.permission.MANAGE_SMARTSPACE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.smartspace.SmartspaceService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

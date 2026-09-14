@@ -1,0 +1,34 @@
+// FundamentalIntelligence — FundamentalOS on-device intelligence provider.
+//
+// v0b: a privileged system_ext app that implements its own
+// android.service.smartspace.SmartspaceService, so it can be wired in as the
+// smartspace provider (replacing ASI) via `cmd smartspace set temporary-service`.
+// Weather now comes live from the FundamentalOS weather app: the service binds
+// org.fundamentalos.weather's IWeatherProvider (AIDL below, Bundle transport),
+// caches the latest snapshot, and stitches it into a weather SmartspaceTarget.
+//
+// platform_apis: true is required because SmartspaceService / SmartspaceTarget /
+// SmartspaceAction live behind @SystemApi (android.service.smartspace.* and
+// android.app.smartspace.*). With platform_apis we leave sdk_version unset.
+
+android_app {
+    name: "FundamentalIntelligence",
+    srcs: [
+        "src/**/*.java",
+        "aidl/**/*.aidl",
+    ],
+    aidl: {
+        local_include_dirs: ["aidl"],
+    },
+    resource_dirs: ["res"],
+    manifest: "AndroidManifest.xml",
+
+    platform_apis: true,
+    system_ext_specific: true,
+    certificate: "platform",
+    privileged: true,
+
+    optimize: {
+        enabled: false,
+    },
+}

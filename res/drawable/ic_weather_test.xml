@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Simple cloud glyph for the v0a smartspace weather smoke test. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6.5,19 C4.01,19 2,16.99 2,14.5 C2,12.19 3.74,10.29 6,10.03 C6.5,7.13 9,5 12,5 C14.62,5 16.88,6.86 17.4,9.43 C19.99,9.7 22,11.87 22,14.5 C22,16.99 19.99,19 17.5,19 Z" />
+</vector>
