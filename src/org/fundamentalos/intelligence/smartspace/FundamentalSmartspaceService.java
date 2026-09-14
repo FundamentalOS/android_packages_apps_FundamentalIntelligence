@@ -1,15 +1,13 @@
 /*
  * FundamentalOS — FundamentalIntelligence
  *
- * SmartspaceService that publishes a live weather SmartspaceTarget built from a
- * snapshot Bundle pushed by the FundamentalOS weather app (bound via
- * WeatherRepository / IWeatherProvider). Replaces ASI as the smartspace provider.
- *
- * The weather target is double-written per the verified contract:
- *   - headerAction: title = temperature text, icon = condition icon, tap = PendingIntent
- *     (read by the lockscreen smartspace weather row)
- *   - baseAction.extras: description / state / use_celsius / temperature(String)
- *     (read by clock-face weather via WeatherData.fromBundle)
+ * SmartspaceService that publishes live SmartspaceTargets built from on-device sources,
+ * replacing ASI as the smartspace provider:
+ *   - weather (FEATURE_WEATHER): a snapshot Bundle pushed by the FundamentalOS weather app
+ *     (bound via WeatherRepository / IWeatherProvider), double-written per the verified contract
+ *       - headerAction: title = temperature text, icon = condition icon, tap = PendingIntent
+ *       - baseAction.extras: description / state / use_celsius / temperature(String)
+ *   - calendar (FEATURE_CALENDAR): the next upcoming event read from CalendarContract.
  */
 package org.fundamentalos.intelligence.smartspace;
 
@@ -22,12 +20,15 @@ import android.app.smartspace.SmartspaceTargetEvent;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.graphics.drawable.Icon;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Process;
 import android.service.smartspace.SmartspaceService;
+import android.text.format.DateUtils;
 import android.util.Log;
 
 import org.fundamentalos.intelligence.R;
+import org.fundamentalos.intelligence.calendar.CalendarRepository;
 import org.fundamentalos.intelligence.weather.WeatherRepository;
 
 import java.util.ArrayList;
@@ -54,12 +55,14 @@ public class FundamentalSmartspaceService extends SmartspaceService
     private final List<SmartspaceSessionId> mSessions = new ArrayList<>();
 
     private WeatherRepository mWeather;
+    private CalendarRepository mCalendar;
 
     @Override
     public void onCreate() {
         super.onCreate();
         mWeather = new WeatherRepository(this, this);
         mWeather.start();
+        mCalendar = new CalendarRepository(this);
         Log.i(TAG, "service created; weather repository started");
     }
 
@@ -69,6 +72,7 @@ public class FundamentalSmartspaceService extends SmartspaceService
             mWeather.stop();
             mWeather = null;
         }
+        mCalendar = null;
         Log.i(TAG, "service destroyed; weather repository stopped");
         super.onDestroy();
     }
@@ -80,13 +84,13 @@ public class FundamentalSmartspaceService extends SmartspaceService
         if (!mSessions.contains(sessionId)) {
             mSessions.add(sessionId);
         }
-        pushWeather(sessionId);
+        pushTargets(sessionId);
     }
 
     @Override
     public void onRequestSmartspaceUpdate(SmartspaceSessionId sessionId) {
         Log.i(TAG, "onRequestSmartspaceUpdate id=" + sessionId);
-        pushWeather(sessionId);
+        pushTargets(sessionId);
     }
 
     @Override
@@ -111,24 +115,26 @@ public class FundamentalSmartspaceService extends SmartspaceService
     public void onWeatherChanged() {
         Log.i(TAG, "onWeatherChanged; re-pushing to " + mSessions.size() + " session(s)");
         for (SmartspaceSessionId sessionId : new ArrayList<>(mSessions)) {
-            pushWeather(sessionId);
+            pushTargets(sessionId);
         }
     }
 
-    private void pushWeather(SmartspaceSessionId sessionId) {
+    /** Build and publish every available target (weather, calendar, ...) to one session. */
+    private void pushTargets(SmartspaceSessionId sessionId) {
         try {
-            SmartspaceTarget target = buildWeatherTarget();
-            if (target == null) {
-                // No data yet (unbound / null cache): publish an empty list rather
-                // than a half-baked or stale target.
-                updateSmartspaceTargets(sessionId, new ArrayList<>());
-                Log.i(TAG, "no weather snapshot; pushed empty target list to " + sessionId);
-                return;
+            final List<SmartspaceTarget> targets = new ArrayList<>();
+            final SmartspaceTarget weather = buildWeatherTarget();
+            if (weather != null) {
+                targets.add(weather);
             }
-            updateSmartspaceTargets(sessionId, List.of(target));
-            Log.i(TAG, "pushed weather target to session " + sessionId);
+            final SmartspaceTarget calendar = buildCalendarTarget();
+            if (calendar != null) {
+                targets.add(calendar);
+            }
+            updateSmartspaceTargets(sessionId, targets);
+            Log.i(TAG, "pushed " + targets.size() + " target(s) to session " + sessionId);
         } catch (Throwable t) {
-            Log.e(TAG, "failed to build/push weather target", t);
+            Log.e(TAG, "failed to build/push targets", t);
         }
     }
 
@@ -195,6 +201,64 @@ public class FundamentalSmartspaceService extends SmartspaceService
                 .setCreationTimeMillis(now - 60_000L)
                 .setExpiryTimeMillis(expiry)
                 .build();
+    }
+
+    /** Builds the calendar target from the next upcoming event, or null if none / no permission. */
+    private SmartspaceTarget buildCalendarTarget() {
+        final CalendarRepository.Event event = mCalendar != null ? mCalendar.nextEvent() : null;
+        if (event == null) {
+            return null;
+        }
+
+        final long now = System.currentTimeMillis();
+        final String timeText = formatEventTime(event);
+
+        final Icon icon = Icon.createWithResource(getPackageName(), R.drawable.ic_smartspace_calendar);
+
+        SmartspaceAction.Builder headerBuilder =
+                new SmartspaceAction.Builder("cal-header", event.title)
+                        .setIcon(icon)
+                        .setContentDescription(
+                                timeText.isEmpty() ? event.title : (event.title + ", " + timeText));
+        if (!timeText.isEmpty()) {
+            headerBuilder.setSubtitle(timeText);
+        }
+        headerBuilder.setPendingIntent(calendarTapIntent(event));
+        SmartspaceAction header = headerBuilder.build();
+
+        ComponentName cn = new ComponentName(this, FundamentalSmartspaceService.class);
+        // Keep it around until a couple of hours after it starts, then let it drop.
+        final long expiry = Math.max(event.beginMs, now) + TWO_HOURS_MS;
+
+        return new SmartspaceTarget.Builder("cal-v0", cn, Process.myUserHandle())
+                .setFeatureType(SmartspaceTarget.FEATURE_CALENDAR)
+                .setHeaderAction(header)
+                .setCreationTimeMillis(now)
+                .setExpiryTimeMillis(expiry)
+                .build();
+    }
+
+    /** A short, locale-formatted time for the event: a time today, a weekday+time otherwise. */
+    private String formatEventTime(CalendarRepository.Event event) {
+        if (event.allDay) {
+            return DateUtils.formatDateTime(this, event.beginMs,
+                    DateUtils.FORMAT_SHOW_DATE | DateUtils.FORMAT_ABBREV_MONTH);
+        }
+        int flags = DateUtils.FORMAT_SHOW_TIME;
+        if (!DateUtils.isToday(event.beginMs)) {
+            flags |= DateUtils.FORMAT_SHOW_WEEKDAY | DateUtils.FORMAT_ABBREV_WEEKDAY;
+        }
+        return DateUtils.formatDateTime(this, event.beginMs, flags);
+    }
+
+    /** Tapping the calendar card opens the calendar app at the event's day/time. */
+    private PendingIntent calendarTapIntent(CalendarRepository.Event event) {
+        final Uri uri = Uri.parse("content://com.android.calendar/time/" + event.beginMs);
+        final Intent intent = new Intent(Intent.ACTION_VIEW)
+                .setData(uri)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return PendingIntent.getActivity(this, 0, intent,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
     /**

@@ -5,10 +5,19 @@
     <!-- Permission the weather app guards its IWeatherProvider service with. -->
     <uses-permission android:name="org.fundamentalos.weather.permission.BIND_WEATHER_PROVIDER" />
 
+    <!-- Read the next upcoming event for the smartspace calendar card. Pre-granted via
+         default-permissions (this service has no UI to request a runtime permission). -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+
     <!-- Package visibility (Android 11+): required so bindService() can resolve
          the weather app's service by explicit package. -->
     <queries>
         <package android:name="org.fundamentalos.weather" />
+        <!-- Resolve the calendar app for the calendar card tap action. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="content" android:host="com.android.calendar" />
+        </intent>
     </queries>
 
     <application
