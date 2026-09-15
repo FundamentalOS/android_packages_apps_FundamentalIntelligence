@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="smartspace_tomorrow_forecast">明天 %1$d°C/%2$d°C</string>
+</resources>

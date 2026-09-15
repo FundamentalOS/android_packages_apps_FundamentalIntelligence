@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Fundamental Intelligence</string>
+    <string name="smartspace_tomorrow_forecast">Tomorrow %1$d°C/%2$d°C</string>
 </resources>

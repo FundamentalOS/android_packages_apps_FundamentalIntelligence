@@ -19,10 +19,14 @@ import android.app.smartspace.SmartspaceTarget;
 import android.app.smartspace.SmartspaceTargetEvent;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.database.ContentObserver;
 import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Process;
+import android.provider.Settings;
 import android.service.smartspace.SmartspaceService;
 import android.text.format.DateUtils;
 import android.util.Log;
@@ -50,9 +54,29 @@ public class FundamentalSmartspaceService extends SmartspaceService
     private static final String K_CONDITION_ICON = "conditionIcon";
     private static final String K_VALID_UNTIL = "validUntilMillis";
     private static final String K_TAP_INTENT = "tapIntent";
+    private static final String K_TOMORROW_TEMP_MAX = "tomorrowTempMax";
+    private static final String K_TOMORROW_TEMP_MIN = "tomorrowTempMin";
+    private static final String K_TOMORROW_DESCRIPTION = "tomorrowDescription";
+    private static final String K_TOMORROW_ICON = "tomorrowConditionIcon";
+
+    // The Pixel weather clock hides the date row and shows the current weather itself,
+    // so its at-a-glance carries tomorrow's forecast instead of the calendar.
+    private static final String WEATHER_CLOCK_ID = "DIGITAL_CLOCK_WEATHER";
+    private static final String CLOCK_FACE_SETTING = "lock_screen_custom_clock_face";
 
     // Track live sessions so we can (re)push proactively as well as on request.
     private final List<SmartspaceSessionId> mSessions = new ArrayList<>();
+
+    // Re-push when the user switches clocks, so the weather-clock at-a-glance appears/clears.
+    private final ContentObserver mClockObserver =
+            new ContentObserver(new Handler(Looper.getMainLooper())) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    for (SmartspaceSessionId id : mSessions) {
+                        pushTargets(id);
+                    }
+                }
+            };
 
     private WeatherRepository mWeather;
     private CalendarRepository mCalendar;
@@ -63,11 +87,14 @@ public class FundamentalSmartspaceService extends SmartspaceService
         mWeather = new WeatherRepository(this, this);
         mWeather.start();
         mCalendar = new CalendarRepository(this);
+        getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(CLOCK_FACE_SETTING), false, mClockObserver);
         Log.i(TAG, "service created; weather repository started");
     }
 
     @Override
     public void onDestroy() {
+        getContentResolver().unregisterContentObserver(mClockObserver);
         if (mWeather != null) {
             mWeather.stop();
             mWeather = null;
@@ -123,16 +150,30 @@ public class FundamentalSmartspaceService extends SmartspaceService
     private void pushTargets(SmartspaceSessionId sessionId) {
         try {
             final List<SmartspaceTarget> targets = new ArrayList<>();
+            final boolean weatherClock = isWeatherClockActive();
             final SmartspaceTarget weather = buildWeatherTarget();
-            if (weather != null) {
-                targets.add(weather);
-            }
-            final SmartspaceTarget calendar = buildCalendarTarget();
-            if (calendar != null) {
-                targets.add(calendar);
+            if (weatherClock) {
+                // The at-a-glance card carries tomorrow's forecast; the weather target is
+                // still pushed so the clock face can read the current conditions from it.
+                final SmartspaceTarget tomorrow = buildTomorrowWeatherTarget();
+                if (tomorrow != null) {
+                    targets.add(tomorrow);
+                }
+                if (weather != null) {
+                    targets.add(weather);
+                }
+            } else {
+                if (weather != null) {
+                    targets.add(weather);
+                }
+                final SmartspaceTarget calendar = buildCalendarTarget();
+                if (calendar != null) {
+                    targets.add(calendar);
+                }
             }
             updateSmartspaceTargets(sessionId, targets);
-            Log.i(TAG, "pushed " + targets.size() + " target(s) to session " + sessionId);
+            Log.i(TAG, "pushed " + targets.size() + " target(s) to session " + sessionId
+                    + " (weatherClock=" + weatherClock + ")");
         } catch (Throwable t) {
             Log.e(TAG, "failed to build/push targets", t);
         }
@@ -201,6 +242,54 @@ public class FundamentalSmartspaceService extends SmartspaceService
                 .setCreationTimeMillis(now - 60_000L)
                 .setExpiryTimeMillis(expiry)
                 .build();
+    }
+
+    /** Builds tomorrow's forecast at-a-glance card for the weather clock, or null if none. */
+    private SmartspaceTarget buildTomorrowWeatherTarget() {
+        final Bundle wx = mWeather != null ? mWeather.getCurrent() : null;
+        if (wx == null || !wx.containsKey(K_TOMORROW_TEMP_MAX)) {
+            return null;
+        }
+        final int tempMax = wx.getInt(K_TOMORROW_TEMP_MAX);
+        final int tempMin = wx.getInt(K_TOMORROW_TEMP_MIN);
+        final String description = wx.getString(K_TOMORROW_DESCRIPTION, "");
+        final long now = System.currentTimeMillis();
+
+        Icon icon = wx.getParcelable(K_TOMORROW_ICON, Icon.class);
+        if (icon == null) {
+            icon = Icon.createWithResource(getPackageName(), R.drawable.ic_weather_test);
+        }
+        final PendingIntent tapIntent = wx.getParcelable(K_TAP_INTENT, PendingIntent.class);
+
+        final String title = getString(R.string.smartspace_tomorrow_forecast, tempMax, tempMin);
+        SmartspaceAction.Builder headerBuilder =
+                new SmartspaceAction.Builder("wx-tomorrow-header", title)
+                        .setIcon(icon)
+                        .setContentDescription(
+                                description.isEmpty() ? title : (title + ", " + description));
+        if (!description.isEmpty()) {
+            headerBuilder.setSubtitle(description);
+        }
+        if (tapIntent != null) {
+            headerBuilder.setPendingIntent(tapIntent);
+        } else {
+            headerBuilder.setIntent(new Intent(Intent.ACTION_MAIN));
+        }
+        SmartspaceAction header = headerBuilder.build();
+
+        ComponentName cn = new ComponentName(this, FundamentalSmartspaceService.class);
+        return new SmartspaceTarget.Builder("wx-tomorrow-v0", cn, Process.myUserHandle())
+                .setFeatureType(SmartspaceTarget.FEATURE_UNDEFINED)
+                .setHeaderAction(header)
+                .setCreationTimeMillis(now)
+                .setExpiryTimeMillis(now + TWO_HOURS_MS)
+                .build();
+    }
+
+    /** True when the lock screen is showing the Pixel weather clock. */
+    private boolean isWeatherClockActive() {
+        final String face = Settings.Secure.getString(getContentResolver(), CLOCK_FACE_SETTING);
+        return face != null && face.contains(WEATHER_CLOCK_ID);
     }
 
     /** Builds the calendar target from the next upcoming event, or null if none / no permission. */
