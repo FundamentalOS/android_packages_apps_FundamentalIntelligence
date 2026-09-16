@@ -8,17 +8,24 @@
  *       - headerAction: title = temperature text, icon = condition icon, tap = PendingIntent
  *       - baseAction.extras: description / state / use_celsius / temperature(String)
  *   - calendar (FEATURE_CALENDAR): the next upcoming event read from CalendarContract.
+ *   - date-row indicators: the next alarm (FEATURE_UPCOMING_ALARM) and Do Not Disturb, rendered
+ *     as chips in SystemUI's DateSmartspaceView.
  */
 package org.fundamentalos.intelligence.smartspace;
 
+import android.app.AlarmManager;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.smartspace.SmartspaceAction;
 import android.app.smartspace.SmartspaceConfig;
 import android.app.smartspace.SmartspaceSessionId;
 import android.app.smartspace.SmartspaceTarget;
 import android.app.smartspace.SmartspaceTargetEvent;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.database.ContentObserver;
 import android.graphics.drawable.Icon;
 import android.net.Uri;
@@ -64,6 +71,15 @@ public class FundamentalSmartspaceService extends SmartspaceService
     private static final String WEATHER_CLOCK_ID = "DIGITAL_CLOCK_WEATHER";
     private static final String CLOCK_FACE_SETTING = "lock_screen_custom_clock_face";
 
+    // Date-row indicator contract, shared verbatim with SystemUI's DateSmartspaceView and
+    // LockscreenSmartspaceController: a header-extra marks the Do-Not-Disturb target (the alarm
+    // target is identified by FEATURE_UPCOMING_ALARM instead).
+    static final String INDICATOR_EXTRA = "org.fundamentalos.smartspace.indicator";
+    static final String INDICATOR_DND = "dnd";
+
+    // Only surface the next alarm while it is coming up within this window.
+    private static final long ALARM_WINDOW_MS = 12 * 60 * 60 * 1000L;
+
     // Track live sessions so we can (re)push proactively as well as on request.
     private final List<SmartspaceSessionId> mSessions = new ArrayList<>();
 
@@ -80,6 +96,18 @@ public class FundamentalSmartspaceService extends SmartspaceService
 
     private WeatherRepository mWeather;
     private CalendarRepository mCalendar;
+    private AlarmManager mAlarmManager;
+    private NotificationManager mNotificationManager;
+
+    // Re-push when the next alarm or the Do-Not-Disturb state changes.
+    private final BroadcastReceiver mIndicatorReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            for (SmartspaceSessionId id : new ArrayList<>(mSessions)) {
+                pushTargets(id);
+            }
+        }
+    };
 
     @Override
     public void onCreate() {
@@ -89,12 +117,23 @@ public class FundamentalSmartspaceService extends SmartspaceService
         mCalendar = new CalendarRepository(this);
         getContentResolver().registerContentObserver(
                 Settings.Secure.getUriFor(CLOCK_FACE_SETTING), false, mClockObserver);
+        mAlarmManager = getSystemService(AlarmManager.class);
+        mNotificationManager = getSystemService(NotificationManager.class);
+        IntentFilter indicatorFilter = new IntentFilter();
+        indicatorFilter.addAction(AlarmManager.ACTION_NEXT_ALARM_CLOCK_CHANGED);
+        indicatorFilter.addAction(NotificationManager.ACTION_INTERRUPTION_FILTER_CHANGED);
+        registerReceiver(mIndicatorReceiver, indicatorFilter, Context.RECEIVER_NOT_EXPORTED);
         Log.i(TAG, "service created; weather repository started");
     }
 
     @Override
     public void onDestroy() {
         getContentResolver().unregisterContentObserver(mClockObserver);
+        try {
+            unregisterReceiver(mIndicatorReceiver);
+        } catch (IllegalArgumentException ignored) {
+            // never registered
+        }
         if (mWeather != null) {
             mWeather.stop();
             mWeather = null;
@@ -170,6 +209,15 @@ public class FundamentalSmartspaceService extends SmartspaceService
                 if (calendar != null) {
                     targets.add(calendar);
                 }
+            }
+            // Date-row indicators ride alongside the cards; SystemUI routes them to the date view.
+            final SmartspaceTarget alarm = buildUpcomingAlarmTarget();
+            if (alarm != null) {
+                targets.add(alarm);
+            }
+            final SmartspaceTarget dnd = buildDndTarget();
+            if (dnd != null) {
+                targets.add(dnd);
             }
             updateSmartspaceTargets(sessionId, targets);
             Log.i(TAG, "pushed " + targets.size() + " target(s) to session " + sessionId
@@ -279,6 +327,76 @@ public class FundamentalSmartspaceService extends SmartspaceService
 
         ComponentName cn = new ComponentName(this, FundamentalSmartspaceService.class);
         return new SmartspaceTarget.Builder("wx-tomorrow-v0", cn, Process.myUserHandle())
+                .setFeatureType(SmartspaceTarget.FEATURE_UNDEFINED)
+                .setHeaderAction(header)
+                .setCreationTimeMillis(now)
+                .setExpiryTimeMillis(now + TWO_HOURS_MS)
+                .build();
+    }
+
+    /**
+     * Builds the next-alarm chip for the date row when an alarm is coming up within
+     * {@link #ALARM_WINDOW_MS}, else null.
+     */
+    private SmartspaceTarget buildUpcomingAlarmTarget() {
+        if (mAlarmManager == null) {
+            return null;
+        }
+        final AlarmManager.AlarmClockInfo info = mAlarmManager.getNextAlarmClock();
+        if (info == null) {
+            return null;
+        }
+        final long now = System.currentTimeMillis();
+        final long trigger = info.getTriggerTime();
+        if (trigger <= now || trigger - now > ALARM_WINDOW_MS) {
+            return null;
+        }
+        int flags = DateUtils.FORMAT_SHOW_TIME;
+        if (!DateUtils.isToday(trigger)) {
+            flags |= DateUtils.FORMAT_SHOW_WEEKDAY | DateUtils.FORMAT_ABBREV_WEEKDAY;
+        }
+        final String timeText = DateUtils.formatDateTime(this, trigger, flags);
+
+        final Icon icon = Icon.createWithResource(getPackageName(), R.drawable.ic_smartspace_alarm);
+        SmartspaceAction header =
+                new SmartspaceAction.Builder("alarm-header", timeText)
+                        .setIcon(icon)
+                        .setContentDescription(timeText)
+                        .build();
+
+        ComponentName cn = new ComponentName(this, FundamentalSmartspaceService.class);
+        return new SmartspaceTarget.Builder("alarm-v0", cn, Process.myUserHandle())
+                .setFeatureType(SmartspaceTarget.FEATURE_UPCOMING_ALARM)
+                .setHeaderAction(header)
+                .setCreationTimeMillis(now)
+                .setExpiryTimeMillis(trigger)
+                .build();
+    }
+
+    /** Builds the Do-Not-Disturb indicator for the date row while zen is on, else null. */
+    private SmartspaceTarget buildDndTarget() {
+        if (mNotificationManager == null) {
+            return null;
+        }
+        final int filter = mNotificationManager.getCurrentInterruptionFilter();
+        if (filter == NotificationManager.INTERRUPTION_FILTER_ALL
+                || filter == NotificationManager.INTERRUPTION_FILTER_UNKNOWN) {
+            return null;
+        }
+        final long now = System.currentTimeMillis();
+        final String desc = getString(R.string.smartspace_dnd_description);
+        final Icon icon = Icon.createWithResource(getPackageName(), R.drawable.ic_smartspace_dnd);
+        final Bundle extras = new Bundle();
+        extras.putString(INDICATOR_EXTRA, INDICATOR_DND);
+        SmartspaceAction header =
+                new SmartspaceAction.Builder("dnd-header", desc)
+                        .setIcon(icon)
+                        .setContentDescription(desc)
+                        .setExtras(extras)
+                        .build();
+
+        ComponentName cn = new ComponentName(this, FundamentalSmartspaceService.class);
+        return new SmartspaceTarget.Builder("dnd-v0", cn, Process.myUserHandle())
                 .setFeatureType(SmartspaceTarget.FEATURE_UNDEFINED)
                 .setHeaderAction(header)
                 .setCreationTimeMillis(now)
